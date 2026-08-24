@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Generated backup archives
+*.tar.zst
+backup-*.tar.zst
+
+# Local overrides (keep backhome.conf tracked as the sample; ignore local copies)
+backhome.local.conf
