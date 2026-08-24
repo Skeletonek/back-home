@@ -27,6 +27,10 @@ struct Cli {
     /// zstd compression level (0-21, default 3)
     #[arg(short = 'l', long, default_value_t = 3)]
     level: i32,
+
+    /// Follow symbolic links when traversing directories (default: do not follow)
+    #[arg(short = 'f', long)]
+    follow_symlinks: bool,
 }
 
 const GLOB_META: &[char] = &['*', '?', '[', ']'];
@@ -100,14 +104,14 @@ fn run() -> Result<()> {
                 .with_context(|| format!("invalid include glob: {pattern}"))?;
             for entry in glob {
                 match entry {
-                    Ok(p) => add_path(&p, &mut files)?,
+                    Ok(p) => add_path(&p, &mut files, cli.follow_symlinks)?,
                     Err(e) => eprintln!("warn: glob error: {e}"),
                 }
             }
         } else if !abs.exists() {
             eprintln!("warn: include path does not exist, skipping: {}", abs.display());
         } else {
-            add_path(&abs, &mut files)?;
+            add_path(&abs, &mut files, cli.follow_symlinks)?;
         }
     }
 
@@ -144,12 +148,16 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn add_path(p: &Path, files: &mut HashSet<PathBuf>) -> Result<()> {
+fn add_path(p: &Path, files: &mut HashSet<PathBuf>, follow_symlinks: bool) -> Result<()> {
     let meta = std::fs::symlink_metadata(p)
         .with_context(|| format!("stat {}", p.display()))?;
 
     if meta.file_type().is_dir() {
-        for e in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
+        for e in WalkDir::new(p)
+            .follow_links(follow_symlinks)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let ft = e.file_type();
             if ft.is_file() || ft.is_symlink() {
                 files.insert(e.path().to_path_buf());
@@ -198,9 +206,22 @@ fn write_archive(output: &Path, files: &[PathBuf], home: &Path, level: i32) -> R
 
     for f in files {
         let archive_name = archive_name_for(f, home);
-        builder
-            .append_path_with_name(f, &archive_name)
-            .with_context(|| format!("adding {} as {}", f.display(), archive_name))?;
+        let meta = std::fs::symlink_metadata(f)
+            .with_context(|| format!("stat {}", f.display()))?;
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(f)
+                .with_context(|| format!("read_link {}", f.display()))?;
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            builder
+                .append_link(&mut header, &archive_name, &target)
+                .with_context(|| format!("adding {} as {}", f.display(), archive_name))?;
+        } else {
+            builder
+                .append_path_with_name(f, &archive_name)
+                .with_context(|| format!("adding {} as {}", f.display(), archive_name))?;
+        }
     }
 
     builder.finish().map_err(|e| anyhow!("tar finish: {e}"))?;
