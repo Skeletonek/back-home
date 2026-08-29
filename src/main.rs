@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use globset::{Glob, GlobSetBuilder};
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use walkdir::WalkDir;
@@ -31,6 +32,10 @@ struct Cli {
     /// Follow symbolic links when traversing directories (default: do not follow)
     #[arg(short = 'f', long)]
     follow_symlinks: bool,
+
+    /// Include binary files (detected via NUL byte). Default: skip them.
+    #[arg(short = 'b', long)]
+    include_binary: bool,
 }
 
 const GLOB_META: &[char] = &['*', '?', '[', ']'];
@@ -91,6 +96,9 @@ fn run() -> Result<()> {
 
     // Collect candidate files from include entries.
     let mut files: HashSet<PathBuf> = HashSet::new();
+    // Literal (non-glob) file/symlink entries are always backed up, even if
+    // binary, since the user spelled out exactly what they want.
+    let mut explicit_files: HashSet<PathBuf> = HashSet::new();
     for inc in &include_patterns {
         let abs = if inc.starts_with('/') {
             PathBuf::from(inc)
@@ -112,6 +120,10 @@ fn run() -> Result<()> {
             eprintln!("warn: include path does not exist, skipping: {}", abs.display());
         } else {
             add_path(&abs, &mut files, cli.follow_symlinks)?;
+            let mt = std::fs::symlink_metadata(&abs)?;
+            if mt.file_type().is_file() || mt.file_type().is_symlink() {
+                explicit_files.insert(abs.clone());
+            }
         }
     }
 
@@ -121,6 +133,7 @@ fn run() -> Result<()> {
     let mut included: Vec<PathBuf> = files
         .into_iter()
         .filter(|f| !is_excluded(f, &exclude_set))
+        .filter(|f| cli.include_binary || explicit_files.contains(f) || !is_binary(f))
         .collect();
     included.sort();
 
@@ -169,8 +182,26 @@ fn add_path(p: &Path, files: &mut HashSet<PathBuf>, follow_symlinks: bool) -> Re
     Ok(())
 }
 
-fn is_excluded(f: &Path, set: &globset::GlobSet) -> bool {
-    if set.is_match(f) {
+fn is_binary(f: &Path) -> bool {
+    let meta = match std::fs::symlink_metadata(f) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if meta.file_type().is_symlink() {
+        return false;
+    }
+    let mut file = match std::fs::File::open(f) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 512];
+    match file.read(&mut buf) {
+        Ok(n) if n > 0 => buf[..n].contains(&0),
+        _ => false,
+    }
+}
+
+fn is_excluded(f: &Path, set: &globset::GlobSet) -> bool {    if set.is_match(f) {
         return true;
     }
     let mut cur = f.parent();

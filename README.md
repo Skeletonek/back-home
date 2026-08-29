@@ -29,6 +29,10 @@ cargo build --release
 
 # choose a zstd compression level (0-21, default 3)
 ./target/release/BackHome -l 10
+
+# include binary files (images, videos, compiled blobs, etc.)
+# by default binary files are skipped
+./target/release/BackHome -b
 ```
 
 Default output file is a `backup-YYYY-MM-DD_HH-MM-SS.tar.zst` in the current working directory.
