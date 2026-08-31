@@ -36,6 +36,14 @@ struct Cli {
     /// Include binary files (detected via NUL byte). Default: skip them.
     #[arg(short = 'b', long)]
     include_binary: bool,
+
+    /// Suppress all non-error output (progress, warnings, summary)
+    #[arg(short = 'q', long, conflicts_with = "verbose")]
+    quiet: bool,
+
+    /// Show per-file paths while backing up (keeps progress bar)
+    #[arg(short = 'v', long, conflicts_with = "quiet")]
+    verbose: bool,
 }
 
 const GLOB_META: &[char] = &['*', '?', '[', ']'];
@@ -113,11 +121,17 @@ fn run() -> Result<()> {
             for entry in glob {
                 match entry {
                     Ok(p) => add_path(&p, &mut files, cli.follow_symlinks)?,
-                    Err(e) => eprintln!("warn: glob error: {e}"),
+                    Err(e) => {
+                        if !cli.quiet {
+                            eprintln!("warn: glob error: {e}");
+                        }
+                    }
                 }
             }
         } else if !abs.exists() {
-            eprintln!("warn: include path does not exist, skipping: {}", abs.display());
+            if !cli.quiet {
+                eprintln!("warn: include path does not exist, skipping: {}", abs.display());
+            }
         } else {
             add_path(&abs, &mut files, cli.follow_symlinks)?;
             let mt = std::fs::symlink_metadata(&abs)?;
@@ -137,7 +151,7 @@ fn run() -> Result<()> {
         .collect();
     included.sort();
 
-    if included.is_empty() {
+    if included.is_empty() && !cli.quiet {
         eprintln!("warn: no files matched; writing empty archive");
     }
 
@@ -149,15 +163,17 @@ fn run() -> Result<()> {
         }
     };
 
-    write_archive(&output, &included, &home, cli.level)?;
+    write_archive(&output, &included, &home, cli.level, cli.quiet, cli.verbose)?;
 
-    let size = std::fs::metadata(&output)?.len();
-    println!(
-        "backed up {} files -> {} ({} bytes)",
-        included.len(),
-        output.display(),
-        size
-    );
+    if !cli.quiet {
+        let size = std::fs::metadata(&output)?.len();
+        println!(
+            "backed up {} files -> {} ({} bytes)",
+            included.len(),
+            output.display(),
+            size
+        );
+    }
     Ok(())
 }
 
@@ -228,15 +244,49 @@ fn archive_name_for(f: &Path, home: &Path) -> String {
     }
 }
 
-fn write_archive(output: &Path, files: &[PathBuf], home: &Path, level: i32) -> Result<()> {
+fn write_archive(
+    output: &Path,
+    files: &[PathBuf],
+    home: &Path,
+    level: i32,
+    quiet: bool,
+    verbose: bool,
+) -> Result<()> {
     let file = std::fs::File::create(output)
         .with_context(|| format!("creating output {}", output.display()))?;
     let enc = zstd::stream::write::Encoder::new(file, level)
         .map_err(|e| anyhow!("zstd encoder: {e}"))?;
     let mut builder = tar::Builder::new(enc);
 
-    for f in files {
+    let total = files.len() as u64;
+    let pb = if quiet || total == 0 {
+        None
+    } else if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        let bar = indicatif::ProgressBar::new(total);
+        bar.set_draw_target(indicatif::ProgressDrawTarget::stdout());
+        bar.set_style(
+            indicatif::ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar()),
+        );
+        Some(bar)
+    } else {
+        None
+    };
+
+    for (idx, f) in files.iter().enumerate() {
         let archive_name = archive_name_for(f, home);
+        if verbose && !quiet {
+            let line = format!("[{}/{}] {}", idx + 1, total, archive_name);
+            if let Some(pb) = &pb {
+                pb.println(line);
+            } else {
+                println!("{line}");
+            }
+        }
+        if let Some(pb) = &pb {
+            pb.set_message(archive_name.clone());
+        }
         let meta = std::fs::symlink_metadata(f)
             .with_context(|| format!("stat {}", f.display()))?;
         if meta.file_type().is_symlink() {
@@ -253,6 +303,13 @@ fn write_archive(output: &Path, files: &[PathBuf], home: &Path, level: i32) -> R
                 .append_path_with_name(f, &archive_name)
                 .with_context(|| format!("adding {} as {}", f.display(), archive_name))?;
         }
+        if let Some(pb) = &pb {
+            pb.inc(1);
+        }
+    }
+
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
     }
 
     builder.finish().map_err(|e| anyhow!("tar finish: {e}"))?;
